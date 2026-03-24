@@ -218,7 +218,7 @@ def resolve_online_rl_backend(
         detected = detect_local_server_type(base_url)
     except Exception:
         detected = None
-    if detected in {"vllm", "ollama"}:
+    if detected in {"vllm", "ollama", "mlx"}:
         return detected
     return None
 
@@ -314,7 +314,7 @@ def publish_online_rl_adapter(
     """Publish a freshly trained adapter to the active local runtime."""
     cfg = cfg or load_online_rl_config()
     backend = resolve_online_rl_backend(runtime_base_url=runtime_base_url, cfg=cfg)
-    if backend not in {"vllm", "ollama"}:
+    if backend not in {"vllm", "ollama", "mlx", None}:
         raise RuntimeError(f"Online RL backend '{backend}' does not support adapter publication")
 
     active_model_name = str(cfg.get("adapter_name") or "hermes-online-rl").strip()
@@ -325,7 +325,7 @@ def publish_online_rl_adapter(
             adapter_name=active_model_name,
             adapter_path=adapter_path,
         )
-    else:
+    elif backend == "ollama":
         active_model_name = str(
             cfg.get("ollama_model_name") or f"{cfg.get('adapter_name') or 'hermes-online-rl'}:latest"
         ).strip()
@@ -335,12 +335,16 @@ def publish_online_rl_adapter(
             adapter_path=adapter_path,
             cfg=cfg,
         )
+    elif backend == "mlx":
+        # MLX adapters are loaded directly from disk via mlx-lm's load()
+        # with adapter_path=. No runtime server push needed.
+        pass
 
     state = load_online_rl_state(cfg)
     state.update(
         {
             "algorithm": str(cfg.get("algorithm") or "mis_po"),
-            "backend": backend,
+            "backend": backend or "mlx",
             "active_model_name": active_model_name,
             "active_adapter_path": str(Path(adapter_path).expanduser()),
             "base_model_name": effective_base_model,
@@ -388,6 +392,13 @@ def resolve_online_rl_model(
     if backend == "ollama":
         resolved["model"] = active_model_name
         resolved["active"] = True
+        return resolved
+
+    if backend == "mlx" and active_adapter_path:
+        # MLX adapters are loaded from disk; mark as active so callers know
+        resolved["model"] = active_model_name
+        resolved["active"] = True
+        resolved["mlx_adapter_path"] = active_adapter_path
         return resolved
 
     return resolved

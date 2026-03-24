@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
 import shutil
 import time
 from dataclasses import dataclass
@@ -22,6 +23,22 @@ from agent.online_rl import (
     publish_online_rl_adapter,
 )
 from hermes_state import SessionDB
+
+
+def _should_use_mlx(cfg: Dict[str, Any]) -> bool:
+    """Return True when training should use the MLX backend."""
+    device = str(cfg.get("device") or "auto").strip().lower()
+    # Explicit MLX request
+    if device == "mlx":
+        return True
+    # Auto-detect: prefer MLX on Apple Silicon when available
+    if device in {"", "auto"} and platform.system() == "Darwin" and platform.machine() == "arm64":
+        try:
+            from agent.online_rl_trainer_mlx import is_mlx_available
+            return is_mlx_available()
+        except ImportError:
+            return False
+    return False
 
 
 @dataclass
@@ -390,7 +407,11 @@ def run_train_batch(
     feedback_ids: Optional[List[int]] = None,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run one batch and update RL feedback statuses in SQLite."""
+    """Run one batch and update RL feedback statuses in SQLite.
+
+    Automatically routes to the MLX-native trainer on Apple Silicon when MLX
+    is available (or when ``device`` is set to ``"mlx"`` in the config).
+    """
     cfg = cfg or load_online_rl_config()
     ids = list(feedback_ids or [])
     if not ids:
@@ -398,11 +419,18 @@ def run_train_batch(
         if env_ids:
             ids = [int(part) for part in env_ids.split(",") if part.strip()]
 
+    # Select the appropriate train_batch implementation
+    if _should_use_mlx(cfg):
+        from agent.online_rl_trainer_mlx import train_batch as mlx_train_batch
+        _train_fn = mlx_train_batch
+    else:
+        _train_fn = train_batch
+
     db = SessionDB()
     try:
         if ids:
             db.mark_rl_feedback_status(ids, trainer_status="training", export_path=str(export_path), last_error=None)
-        result = train_batch(
+        result = _train_fn(
             export_path,
             runtime_base_url=runtime_base_url,
             feedback_ids=ids or None,

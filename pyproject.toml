@@ -66,6 +66,10 @@ online-rl = [
   "transformers>=4.36.0",
   "peft>=0.7.0",
 ]
+online-rl-mlx = [
+  "mlx>=0.18.0",
+  "mlx-lm>=0.20.0",
+]
 rl = [
   "hermes-agent[online-rl]",
   "atroposlib @ git+https://github.com/NousResearch/atropos.git",
