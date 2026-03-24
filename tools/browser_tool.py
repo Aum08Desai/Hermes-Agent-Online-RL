@@ -76,8 +76,35 @@ from tools.browser_providers.browser_use import BrowserUseProvider
 
 logger = logging.getLogger(__name__)
 
-# Standard PATH entries for environments with minimal PATH (e.g. systemd services)
-_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Standard PATH entries for environments with minimal PATH (e.g. systemd services).
+# Includes macOS Homebrew paths (/opt/homebrew/* for Apple Silicon).
+_SANE_PATH = (
+    "/opt/homebrew/bin:/opt/homebrew/sbin:"
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+
+def _discover_homebrew_node_dirs() -> list[str]:
+    """Find Homebrew versioned Node.js bin directories (e.g. node@20, node@24).
+
+    When Node is installed via ``brew install node@24`` and NOT linked into
+    /opt/homebrew/bin, the binary lives only in /opt/homebrew/opt/node@24/bin/.
+    This function discovers those paths so they can be added to subprocess PATH.
+    """
+    dirs: list[str] = []
+    homebrew_opt = "/opt/homebrew/opt"
+    if not os.path.isdir(homebrew_opt):
+        return dirs
+    try:
+        for entry in os.listdir(homebrew_opt):
+            if entry.startswith("node") and entry != "node":
+                # e.g. node@20, node@24
+                bin_dir = os.path.join(homebrew_opt, entry, "bin")
+                if os.path.isdir(bin_dir):
+                    dirs.append(bin_dir)
+    except OSError:
+        pass
+    return dirs
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -94,6 +121,27 @@ DEFAULT_SESSION_TIMEOUT = 300
 
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+
+
+def _get_command_timeout() -> int:
+    """Return the configured browser command timeout from config.yaml.
+
+    Reads ``config["browser"]["command_timeout"]`` and falls back to
+    ``DEFAULT_COMMAND_TIMEOUT`` (30s) if unset or unreadable.
+    """
+    try:
+        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            val = cfg.get("browser", {}).get("command_timeout")
+            if val is not None:
+                return max(int(val), 5)  # Floor at 5s to avoid instant kills
+    except Exception as e:
+        logger.debug("Could not read command_timeout from config: %s", e)
+    return DEFAULT_COMMAND_TIMEOUT
 
 
 def _get_vision_model() -> Optional[str]:
@@ -619,7 +667,8 @@ def _find_agent_browser() -> str:
     """
     Find the agent-browser CLI executable.
     
-    Checks in order: PATH, local node_modules/.bin/, npx fallback.
+    Checks in order: current PATH, Homebrew/common bin dirs, Hermes-managed
+    node, local node_modules/.bin/, npx fallback.
     
     Returns:
         Path to agent-browser executable
@@ -632,15 +681,36 @@ def _find_agent_browser() -> str:
     which_result = shutil.which("agent-browser")
     if which_result:
         return which_result
-    
+
+    # Build an extended search PATH including Homebrew and Hermes-managed dirs.
+    # This covers macOS where the process PATH may not include Homebrew paths.
+    extra_dirs: list[str] = []
+    for d in ["/opt/homebrew/bin", "/usr/local/bin"]:
+        if os.path.isdir(d):
+            extra_dirs.append(d)
+    extra_dirs.extend(_discover_homebrew_node_dirs())
+
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    hermes_node_bin = str(hermes_home / "node" / "bin")
+    if os.path.isdir(hermes_node_bin):
+        extra_dirs.append(hermes_node_bin)
+
+    if extra_dirs:
+        extended_path = os.pathsep.join(extra_dirs)
+        which_result = shutil.which("agent-browser", path=extended_path)
+        if which_result:
+            return which_result
+
     # Check local node_modules/.bin/ (npm install in repo root)
     repo_root = Path(__file__).parent.parent
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
     if local_bin.exists():
         return str(local_bin)
     
-    # Check common npx locations
+    # Check common npx locations (also search extended dirs)
     npx_path = shutil.which("npx")
+    if not npx_path and extra_dirs:
+        npx_path = shutil.which("npx", path=os.pathsep.join(extra_dirs))
     if npx_path:
         return "npx agent-browser"
     
@@ -676,7 +746,7 @@ def _run_browser_command(
     task_id: str,
     command: str,
     args: List[str] = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT
+    timeout: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
@@ -685,11 +755,14 @@ def _run_browser_command(
         task_id: Task identifier to get the right session
         command: The command to run (e.g., "open", "click")
         args: Additional arguments for the command
-        timeout: Command timeout in seconds
+        timeout: Command timeout in seconds.  ``None`` reads
+                 ``browser.command_timeout`` from config (default 30s).
         
     Returns:
         Parsed JSON response from agent-browser
     """
+    if timeout is None:
+        timeout = _get_command_timeout()
     args = args or []
     
     # Build the command
@@ -742,13 +815,18 @@ def _run_browser_command(
         
         browser_env = {**os.environ}
 
-        # Ensure PATH includes Hermes-managed Node first, then standard system dirs.
+        # Ensure PATH includes Hermes-managed Node first, Homebrew versioned
+        # node dirs (for macOS ``brew install node@24``), then standard system dirs.
         hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
         hermes_node_bin = str(hermes_home / "node" / "bin")
 
         existing_path = browser_env.get("PATH", "")
         path_parts = [p for p in existing_path.split(":") if p]
-        candidate_dirs = [hermes_node_bin] + [p for p in _SANE_PATH.split(":") if p]
+        candidate_dirs = (
+            [hermes_node_bin]
+            + _discover_homebrew_node_dirs()
+            + [p for p in _SANE_PATH.split(":") if p]
+        )
 
         for part in reversed(candidate_dirs):
             if os.path.isdir(part) and part not in path_parts:
@@ -968,7 +1046,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(effective_task_id)
     
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=60)
+    result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
     
     if result.get("success"):
         data = result.get("data", {})
@@ -1442,7 +1520,6 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             effective_task_id, 
             "screenshot", 
             screenshot_args,
-            timeout=30
         )
         
         if not result.get("success"):
