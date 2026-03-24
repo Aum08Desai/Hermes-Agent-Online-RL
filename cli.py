@@ -14,6 +14,7 @@ Usage:
 """
 
 import logging
+import inspect
 import os
 import shutil
 import sys
@@ -6077,7 +6078,7 @@ class HermesCLI:
             return [("class:voice-recording", f"● {bar} {state_suffix}")]
         if self._voice_processing:
             return [("class:voice-processing", f"◉ {state_suffix}")]
-        if self._rl_feedback_state:
+        if getattr(self, "_rl_feedback_state", None):
             return [("class:rl-feedback-selected", f"⇅ {state_suffix}")]
         if self._sudo_state:
             return [("class:sudo-prompt", f"🔐 {state_suffix}")]
@@ -6150,7 +6151,7 @@ class HermesCLI:
         *,
         sudo_widget,
         secret_widget,
-        rl_feedback_widget,
+        rl_feedback_widget=None,
         approval_widget,
         clarify_widget,
         spinner_widget,
@@ -6169,24 +6170,30 @@ class HermesCLI:
         this method.  Override this only when you need full control over widget
         ordering.
         """
-        return [
+        children = [
             Window(height=0),
             sudo_widget,
             secret_widget,
-            rl_feedback_widget,
-            approval_widget,
-            clarify_widget,
-            spinner_widget,
-            spacer,
-            *self._get_extra_tui_widgets(),
-            status_bar,
-            input_rule_top,
-            image_bar,
-            input_area,
-            input_rule_bot,
-            voice_status_bar,
-            completions_menu,
         ]
+        if rl_feedback_widget is not None:
+            children.append(rl_feedback_widget)
+        children.extend(
+            [
+                approval_widget,
+                clarify_widget,
+                spinner_widget,
+                spacer,
+                *self._get_extra_tui_widgets(),
+                status_bar,
+                input_rule_top,
+                image_bar,
+                input_area,
+                input_rule_bot,
+                voice_status_bar,
+                completions_menu,
+            ]
+        )
+        return children
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
@@ -7307,26 +7314,34 @@ class HermesCLI:
         # the corresponding interactive prompt is active.
         completions_menu = CompletionsMenu(max_height=12, scroll_offset=1)
 
-        layout = Layout(
-            HSplit(
-                self._build_tui_layout_children(
-                    sudo_widget=sudo_widget,
-                    secret_widget=secret_widget,
-                    rl_feedback_widget=rl_feedback_widget,
-                    approval_widget=approval_widget,
-                    clarify_widget=clarify_widget,
-                    spinner_widget=spinner_widget,
-                    spacer=spacer,
-                    status_bar=status_bar,
-                    input_rule_top=input_rule_top,
-                    image_bar=image_bar,
-                    input_area=input_area,
-                    input_rule_bot=input_rule_bot,
-                    voice_status_bar=voice_status_bar,
-                    completions_menu=completions_menu,
-                )
-            )
+        layout_children_kwargs = {
+            "sudo_widget": sudo_widget,
+            "secret_widget": secret_widget,
+            "rl_feedback_widget": rl_feedback_widget,
+            "approval_widget": approval_widget,
+            "clarify_widget": clarify_widget,
+            "spinner_widget": spinner_widget,
+            "spacer": spacer,
+            "status_bar": status_bar,
+            "input_rule_top": input_rule_top,
+            "image_bar": image_bar,
+            "input_area": input_area,
+            "input_rule_bot": input_rule_bot,
+            "voice_status_bar": voice_status_bar,
+            "completions_menu": completions_menu,
+        }
+        try:
+            build_children_params = inspect.signature(self._build_tui_layout_children).parameters
+        except (TypeError, ValueError):
+            build_children_params = {}
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in build_children_params.values()
         )
+        if "rl_feedback_widget" not in build_children_params and not accepts_var_kwargs:
+            layout_children_kwargs.pop("rl_feedback_widget", None)
+
+        layout = Layout(HSplit(self._build_tui_layout_children(**layout_children_kwargs)))
         
         # Style for the application
         self._tui_style_base = {
