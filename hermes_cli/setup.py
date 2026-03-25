@@ -3123,6 +3123,135 @@ def _detect_local_servers() -> list[dict]:
     return found
 
 
+def _setup_online_rl_tinker(config: dict, rl_config: dict):
+    """Interactive setup for online RL via the Tinker API."""
+    # Check tinker dependency
+    if importlib.util.find_spec("tinker") is None:
+        print_warning("Missing Python package: tinker")
+        print_info("  Install with: pip install 'hermes-agent[online-rl-tinker]'")
+        print_info("  Or: pip install 'tinker @ git+https://github.com/thinking-machines-lab/tinker.git'")
+        print()
+        if not prompt_yes_no("Continue setup anyway? (you can install later)", True):
+            return
+
+    # Step 1: API Key
+    import os
+    current_key = rl_config.get("tinker_api_key") or os.getenv("TINKER_API_KEY") or ""
+    if current_key:
+        print_success("Tinker API key detected.")
+        if not prompt_yes_no("Use existing API key?", True):
+            current_key = ""
+    if not current_key:
+        print_info("Get your API key at: https://tinker-console.thinkingmachines.ai")
+        current_key = prompt("Tinker API key", default="")
+    if not current_key:
+        print_warning("No API key provided. Set TINKER_API_KEY env var before training.")
+
+    # Step 2: Select model
+    print()
+    tinker_models = [
+        ("moonshotai/Kimi-K2.5", "Reasoning + Vision MoE (Large) - best for complex tasks"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", "Hybrid MoE 120B (Large) - strong general-purpose"),
+    ]
+    current_model = rl_config.get("tinker_base_model") or ""
+    model_choices = [f"{name} — {desc}" for name, desc in tinker_models]
+    model_choices.append("Enter a custom Tinker model name")
+    if current_model:
+        model_choices.append(f"Keep current ({current_model})")
+
+    idx = prompt_choice("Which model to train?", model_choices, 0)
+    if idx < len(tinker_models):
+        tinker_model = tinker_models[idx][0]
+    elif idx == len(tinker_models):
+        tinker_model = prompt("Tinker model name", default=current_model)
+    else:
+        tinker_model = current_model
+
+    # Step 3: Feedback prompt toggle
+    print()
+    current_prompt = rl_config.get("prompt_after_response", False)
+    show_feedback = prompt_yes_no(
+        "Show feedback buttons after each response? (upweight / downweight / skip)",
+        default=current_prompt if isinstance(current_prompt, bool) else True,
+    )
+
+    # Step 4: LoRA and training defaults
+    print()
+    print_header("Tinker Training Hyperparameters")
+    current_rank = rl_config.get("tinker_lora_rank", 32)
+    current_lr = rl_config.get("learning_rate", 2e-6)
+    current_batch = rl_config.get("min_batch_size", 8)
+    current_loss = rl_config.get("tinker_loss_fn", "importance_sampling")
+
+    print_info(f"  LoRA rank: {current_rank}")
+    print_info(f"  Learning rate: {current_lr}")
+    print_info(f"  Min batch size: {current_batch}")
+    print_info(f"  Loss function: {current_loss}")
+    print()
+
+    if prompt_yes_no("Use these defaults?", True):
+        lora_rank = current_rank
+        learning_rate = current_lr
+        min_batch = current_batch
+        loss_fn = current_loss
+    else:
+        rank_str = prompt("LoRA rank (16, 32, 64)", default=str(current_rank))
+        try:
+            lora_rank = int(rank_str)
+        except ValueError:
+            lora_rank = current_rank
+        lr_str = prompt("Learning rate", default=str(current_lr))
+        try:
+            learning_rate = float(lr_str)
+        except ValueError:
+            learning_rate = current_lr
+        batch_str = prompt("Min batch size for training", default=str(current_batch))
+        try:
+            min_batch = int(batch_str)
+        except ValueError:
+            min_batch = current_batch
+        loss_choices = ["importance_sampling", "cispo", "ppo"]
+        loss_idx = prompt_choice("Loss function for RL training:", loss_choices, 0)
+        loss_fn = loss_choices[loss_idx]
+
+    # Step 5: Summary
+    print()
+    print_header("Tinker Online RL Configuration Summary")
+    print_info(f"  Backend:         Tinker API (remote)")
+    print_info(f"  Model:           {tinker_model}")
+    print_info(f"  API key:         {'***' + current_key[-4:] if len(current_key) > 4 else '(not set)'}")
+    print_info(f"  Show feedback:   {'Yes' if show_feedback else 'No'}")
+    print_info(f"  LoRA rank:       {lora_rank}")
+    print_info(f"  Learning rate:   {learning_rate}")
+    print_info(f"  Loss function:   {loss_fn}")
+    print_info(f"  Min batch size:  {min_batch}")
+    print()
+
+    if prompt_yes_no("Save this configuration?", True):
+        rl_config["enabled"] = True
+        rl_config["backend"] = "tinker"
+        rl_config["local_only"] = False
+        rl_config["prompt_after_response"] = show_feedback
+        rl_config["tinker_base_model"] = tinker_model
+        rl_config["training_base_model"] = tinker_model
+        rl_config["tinker_lora_rank"] = lora_rank
+        rl_config["tinker_loss_fn"] = loss_fn
+        rl_config["learning_rate"] = learning_rate
+        rl_config["min_batch_size"] = min_batch
+        rl_config["builtin_trainer"] = True
+        if current_key:
+            rl_config["tinker_api_key"] = current_key
+        config["online_rl"] = rl_config
+
+        print_success("Tinker Online RL enabled!")
+        print_info(f"  Training will run remotely on {tinker_model} via Tinker API.")
+        print_info("  Disable anytime: hermes config set online_rl.enabled false")
+        if not current_key:
+            print_warning("  Remember to set TINKER_API_KEY before training.")
+    else:
+        print_info("Tinker Online RL setup skipped.")
+
+
 def setup_online_rl(config: dict):
     """Interactive setup for online RL with LoRA adapters."""
     rl_config = config.get("online_rl") or {}
@@ -3130,8 +3259,20 @@ def setup_online_rl(config: dict):
     print()
     print_header("Online RL Setup")
     print_info("Train a LoRA adapter from your feedback as you use Hermes.")
-    print_info("Requires a locally-hosted model (vLLM, Ollama, etc.)")
+    print_info("Works with local models (vLLM, Ollama, etc.) or remote SOTA models via Tinker API.")
     print()
+
+    # Step 0: Choose backend type
+    backend_choices = [
+        "Local model server (vLLM, Ollama, llama.cpp, MLX)",
+        "Tinker API (remote SOTA models: Kimi-K2.5, Nemotron-3-Super)",
+    ]
+    backend_idx = prompt_choice("Which training backend?", backend_choices, 0)
+    use_tinker = backend_idx == 1
+    print()
+
+    if use_tinker:
+        return _setup_online_rl_tinker(config, rl_config)
 
     # Check for required dependencies
     _missing_deps = []

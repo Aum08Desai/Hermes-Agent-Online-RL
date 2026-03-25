@@ -66,6 +66,10 @@ online-rl-mlx = [
   "mlx>=0.18.0",
   "mlx-lm>=0.20.0",
 ]
+online-rl-tinker = [
+  "tinker @ git+https://github.com/thinking-machines-lab/tinker.git",
+  "numpy>=1.24.0,<3",
+]
 rl = [
   "hermes-agent[online-rl]",
   "atroposlib @ git+https://github.com/NousResearch/atropos.git",

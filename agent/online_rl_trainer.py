@@ -25,6 +25,17 @@ from agent.online_rl import (
 from hermes_state import SessionDB
 
 
+def _should_use_tinker(cfg: Dict[str, Any]) -> bool:
+    """Return True when training should use the Tinker API backend."""
+    backend = str(cfg.get("backend") or "auto").strip().lower()
+    if backend == "tinker":
+        return True
+    # Auto-detect: if tinker_api_key and tinker_base_model are configured
+    if backend in {"", "auto"} and cfg.get("tinker_api_key") and cfg.get("tinker_base_model"):
+        return True
+    return False
+
+
 def _should_use_mlx(cfg: Dict[str, Any]) -> bool:
     """Return True when training should use the MLX backend."""
     device = str(cfg.get("device") or "auto").strip().lower()
@@ -420,7 +431,10 @@ def run_train_batch(
             ids = [int(part) for part in env_ids.split(",") if part.strip()]
 
     # Select the appropriate train_batch implementation
-    if _should_use_mlx(cfg):
+    if _should_use_tinker(cfg):
+        from agent.online_rl_trainer_tinker import train_batch as tinker_train_batch
+        _train_fn = tinker_train_batch
+    elif _should_use_mlx(cfg):
         from agent.online_rl_trainer_mlx import train_batch as mlx_train_batch
         _train_fn = mlx_train_batch
     else:

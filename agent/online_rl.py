@@ -124,6 +124,12 @@ def load_online_rl_config() -> Dict[str, Any]:
         "torch_dtype": str(cfg.get("torch_dtype") or "auto").strip(),
         "trust_remote_code": bool(cfg.get("trust_remote_code", False)),
         "max_saved_adapters": _safe_int(cfg.get("max_saved_adapters", 4), 4),
+        # Tinker API backend settings
+        "tinker_api_key": str(cfg.get("tinker_api_key") or os.getenv("TINKER_API_KEY") or "").strip(),
+        "tinker_base_model": str(cfg.get("tinker_base_model") or "").strip(),
+        "tinker_lora_rank": _safe_int(cfg.get("tinker_lora_rank", 32), 32),
+        "tinker_checkpoint_path": str(cfg.get("tinker_checkpoint_path") or "").strip(),
+        "tinker_loss_fn": str(cfg.get("tinker_loss_fn") or "importance_sampling").strip().lower(),
     }
 
     result["enabled"] = _env_bool("HERMES_ONLINE_RL_ENABLED", result["enabled"])
@@ -170,6 +176,17 @@ def load_online_rl_config() -> Dict[str, Any]:
         os.getenv("HERMES_ONLINE_RL_MAX_SEQUENCE_LENGTH"),
         result["max_sequence_length"],
     )
+    # Tinker env overrides
+    result["tinker_api_key"] = os.getenv("TINKER_API_KEY", result["tinker_api_key"]).strip()
+    result["tinker_base_model"] = os.getenv(
+        "HERMES_ONLINE_RL_TINKER_BASE_MODEL", result["tinker_base_model"]
+    ).strip()
+    result["tinker_loss_fn"] = os.getenv(
+        "HERMES_ONLINE_RL_TINKER_LOSS_FN", result["tinker_loss_fn"]
+    ).strip().lower() or "importance_sampling"
+    result["tinker_lora_rank"] = _safe_int(
+        os.getenv("HERMES_ONLINE_RL_TINKER_LORA_RANK"), result["tinker_lora_rank"]
+    )
     return result
 
 
@@ -182,6 +199,10 @@ def online_rl_enabled_for_runtime(
     cfg = cfg or load_online_rl_config()
     if not cfg.get("enabled"):
         return False
+    # Tinker backend is inherently remote — skip local_only check
+    backend = str(cfg.get("backend") or "auto").strip().lower()
+    if backend == "tinker":
+        return True
     effective_base_url = runtime_base_url or cfg.get("model_base_url")
     if cfg.get("local_only", True) and not is_local_base_url(effective_base_url):
         return False
@@ -211,6 +232,9 @@ def resolve_online_rl_backend(
     backend = str(cfg.get("backend") or "auto").strip().lower()
     if backend and backend != "auto":
         return backend
+    # Auto-detect: if tinker_api_key is set and tinker_base_model configured, use tinker
+    if cfg.get("tinker_api_key") and cfg.get("tinker_base_model"):
+        return "tinker"
     base_url = runtime_base_url or cfg.get("model_base_url")
     if not base_url:
         return None
@@ -304,6 +328,9 @@ def _publish_ollama_adapter_model(
             raise RuntimeError(f"ollama create failed: {stderr}")
 
 
+TINKER_OAI_BASE_URL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
+
+
 def publish_online_rl_adapter(
     adapter_path: str,
     *,
@@ -311,10 +338,10 @@ def publish_online_rl_adapter(
     base_model: Optional[str] = None,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Publish a freshly trained adapter to the active local runtime."""
+    """Publish a freshly trained adapter to the active local runtime or Tinker."""
     cfg = cfg or load_online_rl_config()
     backend = resolve_online_rl_backend(runtime_base_url=runtime_base_url, cfg=cfg)
-    if backend not in {"vllm", "ollama", "mlx", None}:
+    if backend not in {"vllm", "ollama", "mlx", "tinker", None}:
         raise RuntimeError(f"Online RL backend '{backend}' does not support adapter publication")
 
     active_model_name = str(cfg.get("adapter_name") or "hermes-online-rl").strip()
@@ -339,18 +366,37 @@ def publish_online_rl_adapter(
         # MLX adapters are loaded directly from disk via mlx-lm's load()
         # with adapter_path=. No runtime server push needed.
         pass
+    elif backend == "tinker":
+        # Tinker adapters are managed remotely. adapter_path is a tinker:// URI
+        # already saved by the trainer. Nothing to push — just record state.
+        pass
 
     state = load_online_rl_state(cfg)
-    state.update(
-        {
-            "algorithm": str(cfg.get("algorithm") or "mis_po"),
-            "backend": backend or "mlx",
-            "active_model_name": active_model_name,
-            "active_adapter_path": str(Path(adapter_path).expanduser()),
-            "base_model_name": effective_base_model,
-            "updated_at": time.time(),
-        }
-    )
+    if backend == "tinker":
+        # For Tinker, adapter_path is the tinker:// checkpoint URI
+        state.update(
+            {
+                "algorithm": str(cfg.get("algorithm") or "mis_po"),
+                "backend": "tinker",
+                "active_model_name": active_model_name,
+                "active_adapter_path": str(adapter_path),
+                "tinker_checkpoint_path": str(adapter_path),
+                "tinker_oai_base_url": TINKER_OAI_BASE_URL,
+                "base_model_name": effective_base_model or str(cfg.get("tinker_base_model") or ""),
+                "updated_at": time.time(),
+            }
+        )
+    else:
+        state.update(
+            {
+                "algorithm": str(cfg.get("algorithm") or "mis_po"),
+                "backend": backend or "mlx",
+                "active_model_name": active_model_name,
+                "active_adapter_path": str(Path(adapter_path).expanduser()),
+                "base_model_name": effective_base_model,
+                "updated_at": time.time(),
+            }
+        )
     save_online_rl_state(state, cfg)
     return state
 
@@ -400,6 +446,17 @@ def resolve_online_rl_model(
         resolved["active"] = True
         resolved["mlx_adapter_path"] = active_adapter_path
         return resolved
+
+    if backend == "tinker":
+        tinker_ckpt = str(state.get("tinker_checkpoint_path") or active_adapter_path or "").strip()
+        if tinker_ckpt:
+            resolved["model"] = tinker_ckpt
+            resolved["active"] = True
+            resolved["tinker_base_url"] = str(
+                state.get("tinker_oai_base_url") or TINKER_OAI_BASE_URL
+            )
+            resolved["tinker_checkpoint_path"] = tinker_ckpt
+            return resolved
 
     return resolved
 
