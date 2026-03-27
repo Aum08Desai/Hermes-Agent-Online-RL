@@ -134,6 +134,58 @@ PPO clips the importance ratio to `[1-ε, 1+ε]`, which still passes scaled grad
 
 ---
 
+## SDPO: The Self-Distillation Path
+
+The `sdpo` mode is a Tinker-backed approximation of **Self-Distillation Policy Optimization (SDPO)** from [Reinforcement Learning via Self-Distillation](https://arxiv.org/abs/2601.20802), based on the public design in the paper and the reference implementation in [lasgroup/SDPO](https://github.com/lasgroup/SDPO).
+
+### Why SDPO for Hermes?
+
+The paper's main result is that dense distillation targets extracted from the model's own successful behavior can improve online RL relative to scalar-only updates. In Hermes, that matters when feedback includes more than a binary label:
+
+- The **label** (`upweight` / `downweight`) provides the optimization direction
+- The **text note** provides a dense correction or preservation signal
+- The **teacher distribution** provides token-level targets beyond the sampled trajectory
+
+This matches continual agentic usage better than grouped-rollout methods because Hermes still trains on one accepted response at a time.
+
+### Hermes SDPO Approximation
+
+The current implementation is intentionally constrained by Tinker's public training API:
+
+- Teacher mode defaults to `frozen`
+- Distillation uses top-K teacher targets controlled by `sdpo_topk`
+- The SDPO loss is combined with the existing scalar online RL signal
+- `train_steps: 0` means one pass over newly collected feedback instead of a fixed offline training schedule
+- LoRA defaults are separate from the binary / MIS-PO defaults
+
+This keeps the update loop compatible with continual online usage while preserving the main SDPO structure that Hermes can express through Tinker.
+
+### Objective Shape
+
+At a high level, the Hermes SDPO path optimizes a weighted combination of:
+
+```text
+L_total = λ_rl * L_binary_rl + λ_distill * L_teacher_distill
+```
+
+Where:
+
+- `L_binary_rl` is the existing scalar online RL term driven by the positive or negative feedback label
+- `L_teacher_distill` matches the student policy to frozen teacher targets over the response tokens using top-K teacher outputs
+- `λ_rl` and `λ_distill` correspond to `sdpo_rl_weight` and `sdpo_distillation_weight`
+
+### Differences from the Paper
+
+Hermes does not currently implement the full SDPO training stack from the paper:
+
+- no EMA or trust-region teacher updates
+- no full-logit plus tail distillation objective
+- no full `verl` / Ray training topology
+
+The implemented version is a frozen-teacher, top-K distillation approximation designed for Tinker's hosted training interface and Hermes' single-trajectory online feedback loop.
+
+---
+
 ## LoRA Training Details
 
 ### Why LoRA?
