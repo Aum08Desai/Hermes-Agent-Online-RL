@@ -12,7 +12,6 @@ import acp
 from acp.schema import (
     AgentCapabilities,
     AuthenticateResponse,
-    AuthMethod,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
@@ -33,6 +32,11 @@ from acp.schema import (
     TextContentBlock,
     Usage,
 )
+
+try:
+    from acp.schema import AuthMethod
+except ImportError:
+    from acp.schema import AuthMethodAgent as AuthMethod
 
 from acp_adapter.auth import detect_provider, has_provider
 from acp_adapter.events import (
